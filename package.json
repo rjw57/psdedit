@@ -42,6 +42,6 @@
     ]
   },
   "devDependencies": {
-    "typescript-language-server": "^1.2.0"
+    "typescript-language-server": "^2.0.0"
   }
 }

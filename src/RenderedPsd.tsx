@@ -1,5 +1,6 @@
 import * as React from 'react';
-import { Psd, Layer, RGB } from 'ag-psd';
+import { Psd, Layer } from 'ag-psd';
+import { colorToColorString } from './color';
 
 interface RenderedLayerProps {
   layer: Layer;
@@ -14,53 +15,163 @@ const useCanvasDataUrl = (canvas?: HTMLCanvasElement) => {
 const renderFilter = (id: string, layer: Layer) : React.ReactNode => {
   const { effects } = layer;
   const filters: React.ReactNode[] = [];
-  let filterChainResult = 'SourceGraphic';
-
   // Early out for no effects.
   if(!effects) { return null; }
 
+  // Name of layer source graphic. Replaced if the layer has a solid fill effect.
+  let sourceGraphicId = 'SourceGraphic'
+
+  // Ids of filters for each effect which should be composited *below* the original layer.
+  const belowFilters: string[] = [];
+
+  // Solid fill
+  effects.solidFill?.filter(({ enabled }) => enabled).forEach(solidFill => {
+    const { color } = solidFill;
+    const colorString = colorToColorString(color);
+    const filterId = `filter-${filters.length}`;
+
+    // A flood fill with the solid colour.
+    filters.push(
+      <feFlood
+        result={`${filterId}-flood`}
+        key={`${filterId}-flood`}
+        floodColor={colorString}
+      />
+    );
+
+    // Composite the flood fill "in" the alpha mask to return the final coloured effect.
+    filters.push(
+      <feComposite
+        in={`${filterId}-flood`}
+        in2="SourceAlpha"
+        operator="in"
+        result={`${filterId}-fill`}
+        key={`${filterId}-fill`}
+      />
+    );
+
+    // Use the solid fill as the layer image
+    sourceGraphicId = `${filterId}-fill`;
+  });
+
+  // Drop shadow
+  effects.dropShadow?.filter(({ enabled }) => enabled).forEach(dropShadow => {
+    const { angle, distance, size, color } = dropShadow;
+    const colorString = colorToColorString(color);
+
+    // TODO: check sign and chirality
+    const x = - Math.cos(2 * Math.PI * (angle ?? 0) / 360);
+    const y = Math.sin(2 * Math.PI * (angle ?? 0) / 360);
+
+    const filterId = `filter-${filters.length}`;
+
+    // The the alpha layer to generate the drop shadow mask. The colour of this mask is black and
+    // the alpha channel defines the shadow.
+    filters.push(
+      <feOffset
+        in="SourceAlpha"
+        result={`${filterId}-hard-shadow`}
+        key={`${filterId}-hard-shadow`}
+        dx={x} dy={y}
+      />
+    );
+
+    // Blur the hard shadow using the shadow size
+    filters.push(
+      <feGaussianBlur
+        in={`${filterId}-hard-shadow`}
+        result={`${filterId}-shadow`}
+        key={`${filterId}-shadow`}
+        stdDeviation={distance?.value ?? 0}
+      />
+    );
+
+    // A flood fill with the shadow colour.
+    filters.push(
+      <feFlood
+        result={`${filterId}-flood`}
+        key={`${filterId}-flood`}
+        floodColor={colorString}
+      />
+    );
+
+    // Composite the flood fill "in" the mask to return the final coloured effect.
+    filters.push(
+      <feComposite
+        in={`${filterId}-flood`}
+        in2={`${filterId}-hard-shadow`}
+        operator="in"
+        result={`${filterId}-blend`}
+        key={`${filterId}-blend`}
+      />
+    );
+
+    belowFilters.push(`${filterId}-blend`);
+  });
+
   // Stroke effects
   effects.stroke?.filter(({ enabled }) => enabled).forEach(stroke => {
-    const { size } = stroke;
+    const { size, color } = stroke;
+    const colorString = colorToColorString(color);
 
-    // TODO: RGBA, HSL, LAB, CMYK and Grayscale
-    const color = stroke.color as RGB;
+    // How wise should the convolution kernel be in pixels?
+    const kernelPizelSize = size?.value ?? 1;
+    const kernelWidth = Math.ceil(kernelPizelSize) * 2 + 1;
 
-    console.log('stroke', layer.name, stroke, color);
+    // Generate the filter kernel.
+    const rowDelta = new Array(kernelWidth).fill(null).map((_, idx) => idx - 0.5 * (kernelWidth - 1));
+    const kernelMatrix = rowDelta.map(y => (
+      rowDelta.map(x => x*x + y*y <= kernelPizelSize*kernelPizelSize ? 1 : 0).join(' ')
+    )).join('\n');
+
     const filterId = `filter-${filters.length}`;
+
+    // Use the alpha layer to generate a stoke mask. The colour of this mask is black and the alpha
+    // channel defines the stroke.
     filters.push(
-      <feColorMatrix
-        in={filterChainResult}
-        result={`${filterId}-alphaOnly`}
-        key={`${filterId}-alphaOnly`}
-        type="matrix"
-        values={`0 0 0 0 ${color.r / 255}
-                 0 0 0 0 ${color.g / 255}
-                 0 0 0 0 ${color.b / 255}
-                 0 0 0 1 0`}
+      <feConvolveMatrix
+        in="SourceAlpha"
+        result={`${filterId}-stroke`}
+        key={`${filterId}-stroke`}
+        order={kernelWidth}
+        divisor="1"
+        kernelMatrix={kernelMatrix}
       />
     );
+
+    // A flood fill with the stroke colour.
     filters.push(
-      <feMorphology
-        in={`${filterId}-alphaOnly`}
-        operator="dilate" radius={size?.value ?? 0}
-        result={`${filterId}-erode`}
-        key={`${filterId}-erode`}
+      <feFlood
+        result={`${filterId}-flood`}
+        key={`${filterId}-flood`}
+        floodColor={colorString}
       />
     );
+
+    // Composite the stroke flood fill "in" the stroke mask to return the final coloured stroke.
     filters.push(
-      <feMerge
-        result={`${filterId}-result`}
-        key={`${filterId}-result`}
-      >
-        <feMergeNode in={`${filterId}-erode`} />
-        <feMergeNode in={filterChainResult} />
-      </feMerge>
+      <feComposite
+        in={`${filterId}-flood`}
+        in2={`${filterId}-stroke`}
+        operator="in"
+        result={`${filterId}-blend`}
+        key={`${filterId}-blend`}
+      />
     );
-    filterChainResult = `${filterId}-result`;
+
+    belowFilters.push(`${filterId}-blend`);
   });
 
   if(filters.length === 0) { return null; }
+
+  const filterId = `filter-${filters.length}`;
+  filters.push(
+    <feMerge result={filterId} key={filterId}>
+      {belowFilters.map(id => <feMergeNode in={id} key={id} />)}
+      <feMergeNode in={sourceGraphicId} />
+    </feMerge>
+  );
+
   return <filter id={id}>{filters}</filter>;
 };
 
@@ -81,15 +192,15 @@ const renderMask = (id: string, layer: Layer, dataURL?: string) : React.ReactNod
 };
 
 const RenderedLayer = ({layer}: RenderedLayerProps) => {
-  console.log('render', layer.name, layer);
-
-  const { children, hidden, canvas, opacity } = layer;
-  const isGroup = !!children;
+  const { children, hidden, canvas, opacity, text } = layer;
+  const isGroup = !!children, isText = false && !!text;
 
   // All hooks must come before early out.
   const id = `layer-${React.useId()}`;
   const imageDataURL = useCanvasDataUrl(isGroup ? undefined : canvas);
   const maskDataURL = useCanvasDataUrl(layer.mask?.canvas);
+
+  // console.log('render', layer.name, layer);
 
   // Early out for hidden layers.
   if(hidden) { return null; }
@@ -103,6 +214,10 @@ const RenderedLayer = ({layer}: RenderedLayerProps) => {
   const maskId = `${id}-mask`;
   const mask = renderMask(maskId, layer, maskDataURL);
 
+  if(isText) {
+    console.log(layer.name, layer);
+  }
+
   return <>
     { filter }
     { mask }
@@ -112,12 +227,19 @@ const RenderedLayer = ({layer}: RenderedLayerProps) => {
       filter={filter ? `url(#${filterId})` : ''}
       mask={mask ? `url(#${id}-mask)` : ''}
     >
-      { !isGroup &&
+      { !isGroup && !isText &&
         <image
           id={`${id}-content`}
-          x={left} y={top} width={width} height={height}
+          x={left} y={top}
           href={imageDataURL}
         />
+      }
+      {
+        !isGroup && isText &&
+        <text
+          id={`${id}-content`}
+          x={left} y={top}
+        >{text?.text}</text>
       }
       {
         isGroup &&
@@ -132,7 +254,6 @@ interface RenderedPsdProps {
 }
 
 const RenderedPsd = ({psd}: RenderedPsdProps) => {
-  console.log(psd);
   return (
     <svg viewBox={`0 0 ${psd.width} ${psd.height}`} width={psd.width} height={psd.height}>
     {(psd.children || []).map((layer, idx) => <RenderedLayer layer={layer} key={idx} />)}
